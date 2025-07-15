@@ -13,7 +13,7 @@ const defaultSettings = {
   mytoken: 'auto',
   profileToken: 'profiles',
   subConverter: 'url.v1.mk',
-  subConfig: 'https://raw.githubusercontent.com/cmliu/ACL4SSR/main/Clash/config/ACL4SSR_Online_MultiCountry.ini',
+  subConfig: 'https://raw.githubusercontent.com/cmliu/ACL4SSR/refs/heads/main/Clash/config/ACL4SSR_Online_Full.ini',
   prependSubName: true,
   NotifyThresholdDays: 3, 
   NotifyThresholdPercent: 90 
@@ -55,47 +55,82 @@ async function sendTgNotification(settings, message) {
       body: JSON.stringify(payload)
     });
     if (response.ok) {
-      console.log("TG notification sent successfully.");
+      console.log("TG 通知已成功发送。");
       return true;
     } else {
       const errorData = await response.json();
-      console.error("Failed to send TG notification:", response.status, errorData);
+      console.error("发送 TG 通知失败：", response.status, errorData);
       return false;
     }
   } catch (error) {
-    console.error("Error sending TG notification:", error);
+    console.error("发送 TG 通知时出错：", error);
     return false;
   }
 }
 
 async function handleCronTrigger(env) {
-    console.log("Cron trigger fired. Checking all subscriptions...");
+    console.log("Cron trigger fired. Checking all subscriptions for traffic and node count...");
     const allSubs = await env.MISUB_KV.get(KV_KEY_SUBS, 'json') || [];
     const settings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || defaultSettings;
     let changesMade = false;
 
+    const nodeRegex = /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls|socks5):\/\//gm;
+
     for (const sub of allSubs) {
         if (sub.url.startsWith('http') && sub.enabled) {
-            // 複用 /api/node_count 的流量獲取邏輯
             try {
-                const trafficRequest = fetch(new Request(sub.url, { headers: { 'User-Agent': 'Clash for Windows/0.20.39' }, redirect: "follow" }));
-                const response = await Promise.race([trafficRequest, new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 5000))]);
+                // --- 並行請求流量和節點內容 ---
+                const trafficRequest = fetch(new Request(sub.url, { 
+                    headers: { 'User-Agent': 'Clash for Windows/0.20.39' }, 
+                    redirect: "follow",
+                    cf: { insecureSkipVerify: true } 
+                }));
+                const nodeCountRequest = fetch(new Request(sub.url, { 
+                    headers: { 'User-Agent': 'MiSub-Cron-Updater/1.0' }, 
+                    redirect: "follow",
+                    cf: { insecureSkipVerify: true } 
+                }));
+                const [trafficResult, nodeCountResult] = await Promise.allSettled([
+                    Promise.race([trafficRequest, new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 8000))]),
+                    Promise.race([nodeCountRequest, new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), 8000))])
+                ]);   
 
-                if (response.ok) {
-                    const userInfoHeader = response.headers.get('subscription-userinfo');
+                if (trafficResult.status === 'fulfilled' && trafficResult.value.ok) {
+                    const userInfoHeader = trafficResult.value.headers.get('subscription-userinfo');
                     if (userInfoHeader) {
                         const info = {};
                         userInfoHeader.split(';').forEach(part => {
                             const [key, value] = part.trim().split('=');
                             if (key && value) info[key] = /^\d+$/.test(value) ? Number(value) : value;
                         });
-                        sub.userInfo = info; // 更新流量信息
+                        sub.userInfo = info; // 更新流量資訊
                         await checkAndNotify(sub, settings, env); // 檢查並發送通知
                         changesMade = true;
                     }
+                } else if (trafficResult.status === 'rejected') {
+                     console.error(`Cron: Failed to fetch traffic for ${sub.name}:`, trafficResult.reason.message);
                 }
+
+                if (nodeCountResult.status === 'fulfilled' && nodeCountResult.value.ok) {
+                    const text = await nodeCountResult.value.text();
+                    let decoded = '';
+                    try { 
+                        // 嘗試 Base64 解碼
+                        decoded = atob(text.replace(/\s/g, '')); 
+                    } catch { 
+                        decoded = text; 
+                    }
+                    const matches = decoded.match(nodeRegex);
+                    if (matches) {
+                        sub.nodeCount = matches.length; // 更新節點數量
+                        changesMade = true;
+                    }
+                } else if (nodeCountResult.status === 'rejected') {
+                    console.error(`Cron: Failed to fetch node list for ${sub.name}:`, nodeCountResult.reason.message);
+                }
+
             } catch(e) {
-                console.error(`Cron: Failed to update ${sub.name}`, e.message);
+                console.error(`Cron: Unhandled error while updating ${sub.name}`, e.message);
             }
         }
     }
@@ -103,9 +138,11 @@ async function handleCronTrigger(env) {
     // 如果有任何通知時間戳被更新，則保存回 KV
     if (changesMade) {
         await env.MISUB_KV.put(KV_KEY_SUBS, JSON.stringify(allSubs));
-        console.log("Subscription notification timestamps updated.");
+        console.log("Subscriptions updated with new traffic info and node counts.");
+    } else {
+        console.log("Cron job finished. No changes detected.");
     }
-    return new Response("Cron job finished.", { status: 200 });
+    return new Response("Cron job completed successfully.", { status: 200 });
 }
 
 // --- 认证与API处理的核心函数 (无修改) ---
@@ -206,51 +243,51 @@ async function handleApiRequest(request, env) {
             if (newDataExists) {
                 return new Response(JSON.stringify({ success: true, message: '无需迁移，数据已是最新结构。' }), { status: 200 });
             }
-
             if (!oldData) {
                 return new Response(JSON.stringify({ success: false, message: '未找到需要迁移的旧数据。' }), { status: 404 });
             }
             
             await env.MISUB_KV.put(KV_KEY_SUBS, JSON.stringify(oldData));
             await env.MISUB_KV.put(KV_KEY_PROFILES, JSON.stringify([]));
-            
-            // 将旧键重命名，防止重复迁移
             await env.MISUB_KV.put(OLD_KV_KEY + '_migrated_on_' + new Date().toISOString(), JSON.stringify(oldData));
             await env.MISUB_KV.delete(OLD_KV_KEY);
 
             return new Response(JSON.stringify({ success: true, message: '数据迁移成功！' }), { status: 200 });
-
         } catch (e) {
+            console.error('[API Error /migrate]', e);
             return new Response(JSON.stringify({ success: false, message: `迁移失败: ${e.message}` }), { status: 500 });
         }
     }
 
-
-    if (path !== '/login') {
-        if (!await authMiddleware(request, env)) { return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 }); }
-    }
-
-    try {
-        switch (path) {
-            case '/login': {
-                if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
-                const { password } = await request.json();
-                if (password === env.ADMIN_PASSWORD) {
-                    const token = await createSignedToken(env.COOKIE_SECRET, String(Date.now()));
-                    const headers = new Headers({ 'Content-Type': 'application/json' });
-                    headers.append('Set-Cookie', `${COOKIE_NAME}=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_DURATION / 1000}`);
-                    return new Response(JSON.stringify({ success: true }), { headers });
-                }
-                return new Response(JSON.stringify({ error: '密码错误' }), { status: 401 });
-            }
-            case '/logout': {
+    if (path === '/login') {
+        if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+        try {
+            const { password } = await request.json();
+            if (password === env.ADMIN_PASSWORD) {
+                const token = await createSignedToken(env.COOKIE_SECRET, String(Date.now()));
                 const headers = new Headers({ 'Content-Type': 'application/json' });
-                headers.append('Set-Cookie', `${COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`);
+                headers.append('Set-Cookie', `${COOKIE_NAME}=${token}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${SESSION_DURATION / 1000}`);
                 return new Response(JSON.stringify({ success: true }), { headers });
             }
-            // [修改] /data 接口，现在需要读取多个KV值
-            case '/data': {
-                // [最终修正] 如果 KV.get 返回 null (键不存在), 则使用 `|| []` 来确保得到的是一个空数组，防止崩溃
+            return new Response(JSON.stringify({ error: '密码错误' }), { status: 401 });
+        } catch (e) {
+            console.error('[API Error /login]', e);
+            return new Response(JSON.stringify({ error: '请求体解析失败' }), { status: 400 });
+        }
+    }
+    if (!await authMiddleware(request, env)) {
+        return new Response(JSON.stringify({ error: 'Unauthorized' }), { status: 401 });
+    }
+
+    switch (path) {
+        case '/logout': {
+            const headers = new Headers({ 'Content-Type': 'application/json' });
+            headers.append('Set-Cookie', `${COOKIE_NAME}=; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=0`);
+            return new Response(JSON.stringify({ success: true }), { headers });
+        }
+        
+        case '/data': {
+            try {
                 const [misubs, profiles, settings] = await Promise.all([
                     env.MISUB_KV.get(KV_KEY_SUBS, 'json').then(res => res || []),
                     env.MISUB_KV.get(KV_KEY_PROFILES, 'json').then(res => res || []),
@@ -259,50 +296,71 @@ async function handleApiRequest(request, env) {
                 const config = { 
                     FileName: settings.FileName || 'MISUB', 
                     mytoken: settings.mytoken || 'auto',
-                    profileToken: settings.profileToken || 'profiles' // 將 profileToken 也返回給前端
+                    profileToken: settings.profileToken || 'profiles'
                 };
-                  return new Response(JSON.stringify({ misubs, profiles, config }), { headers: { 'Content-Type': 'application/json' } });
+                return new Response(JSON.stringify({ misubs, profiles, config }), { headers: { 'Content-Type': 'application/json' } });
+            } catch(e) {
+                console.error('[API Error /data]', 'Failed to read from KV:', e);
+                return new Response(JSON.stringify({ error: '读取初始数据失败' }), { status: 500 });
             }
-            case '/misubs': {
-                // [优化] 保存数据后，触发一次全面的检查
+        }
+
+        case '/misubs': {
+            try {
                 const { misubs, profiles } = await request.json();
                 if (typeof misubs === 'undefined' || typeof profiles === 'undefined') {
                     return new Response(JSON.stringify({ success: false, message: '请求体中缺少 misubs 或 profiles 字段' }), { status: 400 });
                 }
                 
-                // 获取最新设置用于通知
                 const settings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || defaultSettings;
-
-                // 遍历所有订阅进行检查
                 for (const sub of misubs) {
                     if (sub.url.startsWith('http')) {
                         await checkAndNotify(sub, settings, env);
                     }
                 }
 
-                // 保存更新后的数据（包含了 lastNotified 时间戳）
                 await Promise.all([
                     env.MISUB_KV.put(KV_KEY_SUBS, JSON.stringify(misubs)),
                     env.MISUB_KV.put(KV_KEY_PROFILES, JSON.stringify(profiles))
                 ]);
                 
                 return new Response(JSON.stringify({ success: true, message: '订阅源及订阅组已保存' }));
+            } catch (e) {
+                console.error('[API Error /misubs]', 'Failed to parse request or write to KV:', e);
+                return new Response(JSON.stringify({ error: '保存数据失败' }), { status: 500 });
             }
+        }
+
             case '/node_count': {
-                // [优化] 更新单个订阅后，立即检查并通知
                 if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
                 const { url: subUrl } = await request.json();
                 if (!subUrl || typeof subUrl !== 'string' || !/^https?:\/\//.test(subUrl)) {
                     return new Response(JSON.stringify({ error: 'Invalid or missing url' }), { status: 400 });
                 }
-                const result = { count: 0, userInfo: null };
                 
-                 try {
-                    // ... (获取流量和节点数的逻辑无变化)
-                    const trafficRequest = fetch(new Request(subUrl, { headers: { 'User-Agent': 'Clash for Windows/0.20.39' }, redirect: "follow" }));
-                    const nodeCountRequest = fetch(new Request(subUrl, { headers: { 'User-Agent': 'MiSub-Node-Counter/2.0' }, redirect: "follow" }));
-                    const [trafficResponse, nodeCountResponse] = await Promise.all([trafficRequest, nodeCountRequest]);
-                    if (trafficResponse.ok) {
+                const result = { count: 0, userInfo: null };
+
+                try {
+                    const fetchOptions = {
+                        headers: { 'User-Agent': 'MiSub-Node-Counter/2.0' },
+                        redirect: "follow",
+                        cf: { insecureSkipVerify: true }
+                    };
+                    const trafficFetchOptions = {
+                        headers: { 'User-Agent': 'Clash for Windows/0.20.39' },
+                        redirect: "follow",
+                        cf: { insecureSkipVerify: true }
+                    };
+
+                    const trafficRequest = fetch(new Request(subUrl, trafficFetchOptions));
+                    const nodeCountRequest = fetch(new Request(subUrl, fetchOptions));
+
+                    // --- [核心修正] 使用 Promise.allSettled 替换 Promise.all ---
+                    const responses = await Promise.allSettled([trafficRequest, nodeCountRequest]);
+
+                    // 1. 处理流量请求的结果
+                    if (responses[0].status === 'fulfilled' && responses[0].value.ok) {
+                        const trafficResponse = responses[0].value;
                         const userInfoHeader = trafficResponse.headers.get('subscription-userinfo');
                         if (userInfoHeader) {
                             const info = {};
@@ -312,50 +370,100 @@ async function handleApiRequest(request, env) {
                             });
                             result.userInfo = info;
                         }
+                    } else if (responses[0].status === 'rejected') {
+                        console.error(`Traffic request for ${subUrl} rejected:`, responses[0].reason);
                     }
-                    if (nodeCountResponse.ok) {
+
+                    // 2. 处理节点数请求的结果
+                    if (responses[1].status === 'fulfilled' && responses[1].value.ok) {
+                        const nodeCountResponse = responses[1].value;
                         const text = await nodeCountResponse.text();
                         let decoded = '';
-                        try {
-                            decoded = atob(text.replace(/\s/g, ''));
-                        } catch {
-                            decoded = text;
-                        }
-                        const lineMatches = decoded.match(/^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic):\/\//gm);
+                        try { decoded = atob(text.replace(/\s/g, '')); } catch { decoded = text; }
+                        const lineMatches = decoded.match(/^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls):\/\//gm);
                         if (lineMatches) {
                             result.count = lineMatches.length;
                         }
+                    } else if (responses[1].status === 'rejected') {
+                        console.error(`Node count request for ${subUrl} rejected:`, responses[1].reason);
                     }
+                    
+                    // 只有在至少获取到一个有效信息时，才更新数据库
+                    if (result.userInfo || result.count > 0) {
+                        const allSubs = await env.MISUB_KV.get(KV_KEY_SUBS, 'json') || [];
+                        const subToUpdate = allSubs.find(s => s.url === subUrl);
+
+                        if (subToUpdate) {
+                            subToUpdate.nodeCount = result.count;
+                            subToUpdate.userInfo = result.userInfo;
+                            await env.MISUB_KV.put(KV_KEY_SUBS, JSON.stringify(allSubs));
+                        }
+                    }
+                    
                 } catch (e) {
-                    console.error('Failed to fetch subscription:', e);
+                    console.error(`[API Error /node_count] Unhandled exception for URL: ${subUrl}`, e);
                 }
-                
                 
                 return new Response(JSON.stringify(result), { headers: { 'Content-Type': 'application/json' } });
             }
-            case '/settings': {
-                // [优化] 保存设置后，发送一条通知
-                if (request.method === 'GET') {
+
+        case '/fetch_external_url': { // New case
+            if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+            const { url: externalUrl } = await request.json();
+            if (!externalUrl || typeof externalUrl !== 'string' || !/^https?:\/\//.test(externalUrl)) {
+                return new Response(JSON.stringify({ error: 'Invalid or missing url' }), { status: 400 });
+            }
+
+            try {
+                const response = await fetch(new Request(externalUrl, {
+                    headers: { 'User-Agent': 'MiSub-Proxy/1.0' }, // Identify as proxy
+                    redirect: "follow",
+                    cf: { insecureSkipVerify: true } // Allow insecure SSL for flexibility
+                }));
+
+                if (!response.ok) {
+                    return new Response(JSON.stringify({ error: `Failed to fetch external URL: ${response.status} ${response.statusText}` }), { status: response.status });
+                }
+
+                const content = await response.text();
+                return new Response(content, { headers: { 'Content-Type': 'text/plain; charset=utf-8' } });
+
+            } catch (e) {
+                console.error(`[API Error /fetch_external_url] Failed to fetch ${externalUrl}:`, e);
+                return new Response(JSON.stringify({ error: `Failed to fetch external URL: ${e.message}` }), { status: 500 });
+            }
+        }
+
+        case '/settings': {
+            if (request.method === 'GET') {
+                try {
                     const settings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || {};
                     return new Response(JSON.stringify({ ...defaultSettings, ...settings }), { headers: { 'Content-Type': 'application/json' } });
+                } catch (e) {
+                    console.error('[API Error /settings GET]', 'Failed to read settings from KV:', e);
+                    return new Response(JSON.stringify({ error: '读取设置失败' }), { status: 500 });
                 }
-                if (request.method === 'POST') {
+            }
+            if (request.method === 'POST') {
+                try {
                     const newSettings = await request.json();
                     const oldSettings = await env.MISUB_KV.get(KV_KEY_SETTINGS, 'json') || {};
                     const finalSettings = { ...oldSettings, ...newSettings };
                     await env.MISUB_KV.put(KV_KEY_SETTINGS, JSON.stringify(finalSettings));
-                    // 构造更丰富的通知消息
+                    
                     const message = `⚙️ *MiSub 设置更新* ⚙️\n\n您的 MiSub 应用设置已成功更新。`;
                     await sendTgNotification(finalSettings, message);
+                    
                     return new Response(JSON.stringify({ success: true, message: '设置已保存' }));
+                } catch (e) {
+                    console.error('[API Error /settings POST]', 'Failed to parse request or write settings to KV:', e);
+                    return new Response(JSON.stringify({ error: '保存设置失败' }), { status: 500 });
                 }
-                return new Response('Method Not Allowed', { status: 405 });
             }
+            return new Response('Method Not Allowed', { status: 405 });
         }
-    } catch (e) { 
-        console.error("API Error:", e);
-        return new Response(JSON.stringify({ error: 'Internal Server Error' }), { status: 500 });
     }
+    
     return new Response('API route not found', { status: 404 });
 }
 // --- 名称前缀辅助函数 (无修改) ---
@@ -398,7 +506,7 @@ function prependNodeName(link, prefix) {
 
 // --- 节点列表生成函数 ---
 async function generateCombinedNodeList(context, config, userAgent, misubs, prependedContent = '') {
-    const nodeRegex = /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls):\/\//;
+    const nodeRegex = /^(ss|ssr|vmess|vless|trojan|hysteria2?|hy|hy2|tuic|anytls|socks5):\/\//;
     let manualNodesContent = '';
     const normalizeVmessLink = (link) => {
         if (!link.startsWith('vmess://')) return link;
@@ -447,14 +555,91 @@ async function generateCombinedNodeList(context, config, userAgent, misubs, prep
             } catch (e) {}
             let validNodes = text.replace(/\r\n/g, '\n').split('\n')
                 .map(line => line.trim()).filter(line => nodeRegex.test(line));
-            validNodes = validNodes.filter(nodeLink => {
-                try {
-                    const hashIndex = nodeLink.lastIndexOf('#');
-                    if (hashIndex === -1) return true;
-                    const nodeName = decodeURIComponent(nodeLink.substring(hashIndex + 1));
-                    return !nodeName.includes('https://');
-                } catch (e) { return false; }
-            });
+
+            // [核心重構] 引入白名單 (keep:) 和黑名單 (exclude) 模式
+            if (sub.exclude && sub.exclude.trim() !== '') {
+                const rules = sub.exclude.trim().split('\n').map(r => r.trim()).filter(Boolean);
+                
+                const keepRules = rules.filter(r => r.toLowerCase().startsWith('keep:'));
+
+                if (keepRules.length > 0) {
+                    // --- 白名單模式 (Inclusion Mode) ---
+                    const nameRegexParts = [];
+                    const protocolsToKeep = new Set();
+
+                    keepRules.forEach(rule => {
+                        const content = rule.substring('keep:'.length).trim();
+                        if (content.toLowerCase().startsWith('proto:')) {
+                            const protocols = content.substring('proto:'.length).split(',').map(p => p.trim().toLowerCase());
+                            protocols.forEach(p => protocolsToKeep.add(p));
+                        } else {
+                            nameRegexParts.push(content);
+                        }
+                    });
+
+                    const nameRegex = nameRegexParts.length > 0 ? new RegExp(nameRegexParts.join('|'), 'i') : null;
+                    
+                    validNodes = validNodes.filter(nodeLink => {
+                        // 檢查協議是否匹配
+                        const protocolMatch = nodeLink.match(/^(.*?):\/\//);
+                        const protocol = protocolMatch ? protocolMatch[1].toLowerCase() : '';
+                        if (protocolsToKeep.has(protocol)) {
+                            return true;
+                        }
+
+                        // 檢查名稱是否匹配
+                        if (nameRegex) {
+                            const hashIndex = nodeLink.lastIndexOf('#');
+                            if (hashIndex !== -1) {
+                                try {
+                                    const nodeName = decodeURIComponent(nodeLink.substring(hashIndex + 1));
+                                    if (nameRegex.test(nodeName)) {
+                                        return true;
+                                    }
+                                } catch (e) { /* 忽略解碼錯誤 */ }
+                            }
+                        }
+                        return false; // 白名單模式下，不匹配任何規則則排除
+                    });
+
+                } else {
+                    // --- 黑名單模式 (Exclusion Mode) ---
+                    const protocolsToExclude = new Set();
+                    const nameRegexParts = [];
+
+                    rules.forEach(rule => {
+                        if (rule.toLowerCase().startsWith('proto:')) {
+                            const protocols = rule.substring('proto:'.length).split(',').map(p => p.trim().toLowerCase());
+                            protocols.forEach(p => protocolsToExclude.add(p));
+                        } else {
+                            nameRegexParts.push(rule);
+                        }
+                    });
+                    
+                    const nameRegex = nameRegexParts.length > 0 ? new RegExp(nameRegexParts.join('|'), 'i') : null;
+
+                    validNodes = validNodes.filter(nodeLink => {
+                        const protocolMatch = nodeLink.match(/^(.*?):\/\//);
+                        const protocol = protocolMatch ? protocolMatch[1].toLowerCase() : '';
+                        if (protocolsToExclude.has(protocol)) {
+                            return false;
+                        }
+
+                        if (nameRegex) {
+                            const hashIndex = nodeLink.lastIndexOf('#');
+                            if (hashIndex !== -1) {
+                                try {
+                                    const nodeName = decodeURIComponent(nodeLink.substring(hashIndex + 1));
+                                    if (nameRegex.test(nodeName)) {
+                                        return false;
+                                    }
+                                } catch (e) { /* 忽略解碼錯誤 */ }
+                            }
+                        }
+                        return true;
+                    });
+                }
+            }
             return (config.prependSubName && sub.name)
                 ? validNodes.map(node => prependNodeName(node, sub.name)).join('\n')
                 : validNodes.join('\n');
@@ -507,23 +692,42 @@ async function handleMisubRequest(context) {
     let effectiveSubConverter;
     let effectiveSubConfig;
 
+    const DEFAULT_EXPIRED_VLESS_NODE = "vless://88888888-8888-8888-8888-888888888888@127.0.0.1:1234?encryption=none&security=tls&sni=daoqi.chaoqi.com&fp=random&allowInsecure=1&type=ws&host=daoqi.chaoqi.com&path=%2F%3Fed%3D2560#%E6%82%A8%E7%9A%84%E8%AE%A2%E9%98%85%E5%B7%B2%E5%88%B0%E6%9C%9F";
+
     if (profileIdentifier) {
-        // [修正] 使用 config 變量
-        if (config.profileToken === 'profiles') {
-            return new Response('For security reasons, you must set a custom Profile Token in the settings before sharing profiles.', { status: 403 });
-        }
+
         // [修正] 使用 config 變量
         if (!token || token !== config.profileToken) {
             return new Response('Invalid Profile Token', { status: 403 });
         }
         const profile = allProfiles.find(p => (p.customId && p.customId === profileIdentifier) || p.id === profileIdentifier);
         if (profile && profile.enabled) {
+            // Check if the profile has an expiration date and if it's expired
+            if (profile.expiresAt) {
+                const expiryDate = new Date(profile.expiresAt);
+                const now = new Date();
+                if (now > expiryDate) {
+                    console.log(`Profile ${profile.name} (ID: ${profile.id}) has expired.`);
+                    return new Response(DEFAULT_EXPIRED_VLESS_NODE, {
+                        headers: { 'Content-Type': 'text/plain; charset=utf-8' }
+                    });
+                }
+            }
+
             subName = profile.name;
             const profileSubIds = new Set(profile.subscriptions);
             const profileNodeIds = new Set(profile.manualNodes);
-            targetMisubs = allMisubs.filter(item => (item.url.startsWith('http') ? profileSubIds.has(item.id) : profileNodeIds.has(item.id)));
-            
-            // [修正] 使用 config 變量作為回退
+            targetMisubs = allMisubs.filter(item => {
+                const isSubscription = item.url.startsWith('http');
+                const isManualNode = !isSubscription;
+
+                // Check if the item belongs to the current profile and is enabled
+                const belongsToProfile = (isSubscription && profileSubIds.has(item.id)) || (isManualNode && profileNodeIds.has(item.id));
+                if (!item.enabled || !belongsToProfile) {
+                    return false;
+                }
+                return true;
+            });
             effectiveSubConverter = profile.subConverter && profile.subConverter.trim() !== '' ? profile.subConverter : config.subConverter;
             effectiveSubConfig = profile.subConfig && profile.subConfig.trim() !== '' ? profile.subConfig : config.subConfig;
         } else {
@@ -543,8 +747,6 @@ async function handleMisubRequest(context) {
     if (!effectiveSubConverter || effectiveSubConverter.trim() === '') {
         return new Response('Subconverter backend is not configured.', { status: 500 });
     }
-
-    // --- 後續所有邏輯保持不變 ---
     
     let targetFormat = url.searchParams.get('target');
     if (!targetFormat) {
@@ -558,14 +760,36 @@ async function handleMisubRequest(context) {
     }
     if (!targetFormat) {
         const ua = userAgentHeader.toLowerCase();
-        const uaMapping = {
-            'clash': 'clash', 'meta': 'clash', 'stash': 'clash', 'nekoray': 'clash',
-            'sing-box': 'singbox', 'shadowrocket': 'base64', 'v2rayn': 'base64',
-            'v2rayng': 'base64', 'surge': 'surge', 'loon': 'loon',
-            'quantumult%20x': 'quanx', 'quantumult': 'quanx',
-        };
-        for (const key in uaMapping) {
-            if (ua.includes(key)) { targetFormat = uaMapping[key]; break; }
+        // 使用陣列來保證比對的優先順序
+        const uaMapping = [
+            // 優先匹配 Mihomo/Meta 核心的客戶端
+            ['flyclash', 'clash'],
+            ['mihomo', 'clash'],
+            ['clash.meta', 'clash'],
+            ['clash-verge', 'clash'],
+            ['meta', 'clash'],
+            
+            // 其他客戶端
+            ['stash', 'clash'],
+            ['nekoray', 'clash'],
+            ['sing-box', 'singbox'],
+            ['shadowrocket', 'base64'],
+            ['v2rayn', 'base64'],
+            ['v2rayng', 'base64'],
+            ['surge', 'surge'],
+            ['loon', 'loon'],
+            ['quantumult%20x', 'quanx'],
+            ['quantumult', 'quanx'],
+
+            // 最後才匹配通用的 clash，作為向下相容
+            ['clash', 'clash']
+        ];
+
+        for (const [keyword, format] of uaMapping) {
+            if (ua.includes(keyword)) {
+                targetFormat = format;
+                break; // 找到第一個符合的就停止
+            }
         }
     }
     if (!targetFormat) { targetFormat = 'clash'; }
@@ -612,7 +836,7 @@ async function handleMisubRequest(context) {
     const subconverterUrl = new URL(`https://${effectiveSubConverter}/sub`);
     subconverterUrl.searchParams.set('target', targetFormat);
     subconverterUrl.searchParams.set('url', callbackUrl);
-    if (effectiveSubConfig && effectiveSubConfig.trim() !== '') {
+    if ((targetFormat === 'clash' || targetFormat === 'loon' || targetFormat === 'surge') && effectiveSubConfig && effectiveSubConfig.trim() !== '') {
         subconverterUrl.searchParams.set('config', effectiveSubConfig);
     }
     subconverterUrl.searchParams.set('new_name', 'true');

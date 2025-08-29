@@ -16,7 +16,7 @@ const props = defineProps({
 
 const emit = defineEmits([
   'add', 'delete', 'edit', 'changePage', 'update:searchTerm', 'update:viewMode',
-  'toggleSort', 'markDirty', 'autoSort', 'deduplicate', 'import'
+  'toggleSort', 'markDirty', 'autoSort', 'deduplicate', 'import', 'deleteAll'
 ]);
 
 const nodesMoreMenuRef = ref(null);
@@ -121,10 +121,17 @@ const currentPage = ref(1);
 const nodesPerPage = 24;
 const totalPages = computed(() => Math.ceil(filteredNodes.value.length / nodesPerPage));
 
+// 计算当前显示的节点数据
 const paginatedNodes = computed(() => {
-  const start = (currentPage.value - 1) * nodesPerPage;
-  const end = start + nodesPerPage;
-  return filteredNodes.value.slice(start, end);
+  if (localSearchTerm.value) {
+    // 搜索时使用本地过滤和分页
+    const start = (currentPage.value - 1) * nodesPerPage;
+    const end = start + nodesPerPage;
+    return filteredNodes.value.slice(start, end);
+  } else {
+    // 非搜索时使用props传入的分页数据
+    return props.paginatedManualNodes;
+  }
 });
 
 // 监听搜索词变化重置分页
@@ -249,7 +256,7 @@ onUnmounted(() => {
       </div>
       
       <div v-if="viewMode === 'card'">
-         <draggable 
+        <draggable 
           v-if="isSorting && !localSearchTerm"
           tag="div" 
           class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-2 xl:grid-cols-3 gap-3" 
@@ -283,16 +290,40 @@ onUnmounted(() => {
       </div>
 
       <div v-if="viewMode === 'list'" class="space-y-2">
+        <draggable 
+          v-if="isSorting && !localSearchTerm"
+          tag="div" 
+          class="space-y-2" 
+          :list="manualNodes" 
+          item-key="id" 
+          animation="300" 
+          @end="handleSortEnd"
+        >
+          <template #item="{ element: node, index }">
+            <div class="cursor-move">
+              <ManualNodeList
+                  :node="node"
+                  :index="index + 1"
+                  class="list-item-animation"
+                  :style="{ '--delay-index': index }"
+                  @edit="handleEdit(node.id)"
+                  @delete="handleDelete(node.id)"
+              />
+            </div>
+          </template>
+        </draggable>
+        <div v-else>
           <ManualNodeList
               v-for="(node, index) in paginatedNodes"
               :key="node.id"
               :node="node"
-              :index="(currentPage - 1) * 24 + index + 1"
+              :index="localSearchTerm ? (currentPage - 1) * 24 + index + 1 : (props.currentPage - 1) * 24 + index + 1"
               :class="`list-item-animation`"
               :style="{ '--delay-index': index }"
               @edit="handleEdit(node.id)"
               @delete="handleDelete(node.id)"
           />
+        </div>
       </div>
       
       <!-- 分页 - 搜索时使用本地分页，否则使用props -->
@@ -311,7 +342,7 @@ onUnmounted(() => {
       </div>
       
       <!-- 非搜索时的原有分页 -->
-      <div v-else-if="!localSearchTerm && props.totalPages > 1 && !isSorting" class="flex justify-center items-center space-x-4 mt-8 text-sm font-medium">
+      <div v-else-if="!localSearchTerm && props.totalPages > 1" class="flex justify-center items-center space-x-4 mt-8 text-sm font-medium">
         <button 
           @click="handleChangePage(props.currentPage - 1)" 
           :disabled="props.currentPage === 1" 
